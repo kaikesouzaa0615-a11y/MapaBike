@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>MapaBike</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;background:#fff;color:#222}
+#map{height:100vh;width:100vw}.panel{position:fixed;z-index:1000;top:10px;left:10px;right:10px;background:#fff;border-radius:16px;padding:11px;box-shadow:0 3px 18px #0003;max-height:42vh;overflow:auto}
+.row{display:flex;gap:8px}.row input{flex:1;min-width:0;padding:13px;border:1px solid #ddd;border-radius:12px;font-size:16px}button{border:0;border-radius:12px;padding:12px 14px;font-weight:700;background:#222;color:#fff}
+#destinationCard{display:none;margin-top:9px;padding:10px 12px;border-radius:12px;background:#f5f5f5;border-left:5px solid #222}
+.destTitle{font-size:11px;font-weight:800;color:#666;text-transform:uppercase;letter-spacing:.4px}.destText{font-size:15px;font-weight:800;margin-top:3px;line-height:1.25;overflow-wrap:anywhere}
+#arrival{display:none;margin-top:8px;padding:10px 12px;border-radius:12px;background:#fff3cd;border:1px solid #ffe08a;font-weight:800}.arrivalSmall{font-size:12px;font-weight:600;margin-top:2px}
+#route{margin-top:8px;font-size:13px;line-height:1.35}.legend{display:flex;gap:7px;flex-wrap:wrap;margin-top:7px}.badge{padding:5px 8px;border-radius:999px;font-weight:700;font-size:12px}.up{background:#ffcc80}.hard{background:#ef5350;color:#fff}.down{background:#81c784}.flat{background:#ddd}
+#loading{display:none;color:#666;margin-top:7px}.hint{font-size:11px;color:#777;margin-top:6px}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="panel">
+  <div class="row">
+    <input id="dest" placeholder="Digite o endereço da entrega">
+    <button onclick="route()">IR</button>
+  </div>
+  <div id="destinationCard">
+    <div class="destTitle">Endereço da entrega</div>
+    <div id="destinationText" class="destText"></div>
+  </div>
+  <div id="arrival">
+    <div id="arrivalMain">📍 Chegando ao destino</div>
+    <div class="arrivalSmall">Confira o número da casa ou apartamento antes de parar.</div>
+  </div>
+  <div id="loading">Calculando rota e inclinação…</div>
+  <div id="route"></div>
+  <div class="legend">
+    <span class="badge up">↑ Subida</span><span class="badge hard">↑ Subida forte</span>
+    <span class="badge down">↓ Descida</span><span class="badge flat">→ Plano</span>
+  </div>
+  <div class="hint">O endereço informado fica visível durante a navegação para facilitar a conferência da entrega.</div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map=L.map('map').setView([-23.55,-46.63],13);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap'}).addTo(map);
+let line=null,markers=[],destination=null,watchId=null;
+
+function clearRoute(){if(line)map.removeLayer(line);markers.forEach(m=>map.removeLayer(m));markers=[];}
+function startArrivalTracking(){
+  if(watchId!==null)navigator.geolocation.clearWatch(watchId);
+  if(!destination)return;
+  watchId=navigator.geolocation.watchPosition(pos=>{
+    const d=haversine([pos.coords.latitude,pos.coords.longitude],destination);
+    const el=document.getElementById('arrival'), main=document.getElementById('arrivalMain');
+    if(d<=250){
+      el.style.display='block';
+      main.textContent=d<=60?'🏠 DESTINO AQUI — confira o número':`📍 Destino em ${Math.round(d)} m`;
+    }else el.style.display='none';
+  },()=>{}, {enableHighAccuracy:true,maximumAge:3000,timeout:10000});
+}
+
+async function route(){
+  const q=document.getElementById('dest').value.trim();if(!q)return;
+  document.getElementById('loading').style.display='block';document.getElementById('route').innerHTML='';
+  document.getElementById('arrival').style.display='none';clearRoute();
+  try{
+    const pos=await new Promise((resolve,reject)=>navigator.geolocation.getCurrentPosition(resolve,reject,{enableHighAccuracy:true,timeout:10000}));
+    const lat=pos.coords.latitude,lon=pos.coords.longitude;
+    const geo=await fetch('https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=br&q='+encodeURIComponent(q),{headers:{'Accept-Language':'pt-BR'}}).then(r=>r.json());
+    if(!geo.length)throw new Error('Endereço não encontrado.');
+    const dlat=+geo[0].lat,dlon=+geo[0].lon;destination=[dlat,dlon];
+
+    // Mantém exatamente o texto digitado pelo entregador/cliente visível no topo.
+    document.getElementById('destinationText').textContent=q;
+    document.getElementById('destinationCard').style.display='block';
+    startArrivalTracking();
+
+    const r=await fetch(`https://router.project-osrm.org/route/v1/cycling/${lon},${lat};${dlon},${dlat}?overview=full&geometries=geojson`).then(r=>r.json());
+    if(!r.routes?.length)throw new Error('Não foi possível calcular a rota.');
+    const coords=r.routes[0].geometry.coordinates.map(p=>[p[1],p[0]]);
+    line=L.polyline(coords,{weight:6}).addTo(map);map.fitBounds(line.getBounds(),{padding:[20,220]});
+    markers.push(L.marker([dlat,dlon]).addTo(map).bindPopup('<b>Destino</b><br>'+escapeHtml(q)).openPopup());
+
+    const step=Math.max(1,Math.floor(coords.length/25));
+    const sample=coords.filter((_,i)=>i%step===0||i===coords.length-1);const elevations=[];
+    for(const p of sample){try{const e=await fetch('https://api.open-elevation.com/api/v1/lookup?locations='+p[0]+','+p[1]).then(x=>x.json());elevations.push(e.results?.[0]?.elevation??null)}catch(_){elevations.push(null)}}
+    let ups=0,downs=0,hard=0;const segments=[];
+    for(let i=1;i<sample.length;i++){
+      const a=sample[i-1],b=sample[i],ea=elevations[i-1],eb=elevations[i];if(ea==null||eb==null)continue;
+      const dist=haversine(a,b);if(dist<1)continue;const grade=((eb-ea)/dist)*100;
+      let type='Plano',cls='flat',icon='→';
+      if(grade>=7){type='Subida forte';cls='hard';icon='↑';hard++;ups++}else if(grade>=3){type='Subida';cls='up';icon='↑';ups++}else if(grade<=-3){type='Descida';cls='down';icon='↓';downs++}
+      segments.push({i,type,cls,icon,grade:grade.toFixed(1)});
+    }
+    segments.filter(s=>s.cls!=='flat').forEach(s=>{const p=sample[s.i],mk=L.circleMarker(p,{radius:8,weight:2}).addTo(map);mk.bindPopup(`<b>${s.icon} ${s.type}</b><br>Inclinação aproximada: ${s.grade}%`);markers.push(mk)});
+    const km=(r.routes[0].distance/1000).toFixed(1),min=Math.round(r.routes[0].duration/60);
+    document.getElementById('route').innerHTML=`<b>${km} km</b> · ${min} min<br>Subidas: <b>${ups}</b> · Subidas fortes: <b>${hard}</b> · Descidas: <b>${downs}</b><br><small>Os pontos coloridos mostram mudanças de inclinação detectadas na rota.</small>`;
+  }catch(e){document.getElementById('route').innerHTML='<b>Erro:</b> '+escapeHtml(e.message)}finally{document.getElementById('loading').style.display='none'}
+}
+function escapeHtml(s){return s.replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
+function haversine(a,b){const R=6371000,p1=a[0]*Math.PI/180,p2=b[0]*Math.PI/180,dp=(b[0]-a[0])*Math.PI/180,dl=(b[1]-a[1])*Math.PI/180,x=Math.sin(dp/2)**2+Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)**2;return 2*R*Math.asin(Math.sqrt(x))}
+</script>
+</body>
+</html>
